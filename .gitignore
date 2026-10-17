@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+vgb_work/
+norma_run/
+norma_feats/

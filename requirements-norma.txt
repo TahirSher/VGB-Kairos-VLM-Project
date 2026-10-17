@@ -1,3 +1,4 @@
+# Python >= 3.10
 torch>=2.2
 transformers>=4.49        # Qwen2.5-VL support; tested against 5.x module layout too
 peft>=0.11
@@ -5,7 +6,7 @@ accelerate>=0.30
 numpy>=1.24
 scipy>=1.10
 pillow>=10.0
-av>=11.0                  # Stage-1 decoding (vgb_stage12.py)
+av>=11.0                  # video decoding (preprocess)
 datasets>=2.18            # Stage-1 metadata ingest
 # optional
 openai>=1.30              # OpenAI-compatible judge endpoint (OpenAI or a local vLLM server)

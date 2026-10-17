@@ -4,6 +4,13 @@ A trained, backbone-agnostic VLM model for **open-ended, temporally grounded
 game-glitch detection** on VideoGlitchBench, built to be compared with GliDe
 (arXiv 2604.07818) under a protocol that makes the comparison valid.
 
+Everything is in **one script, `norma_vgb.py`** (Python ≥ 3.10). It contains:
+- preprocessing and the frame cache;
+- the four systems (vanilla, direct-SFT, a GliDe reproduction, NORMA), all running on one shared backbone adapter;
+- evaluation, statistics, cost accounting and self-tests.
+
+It no longer depends on `vgb_stage12.py` or the KAIROS file.
+
 ---
 
 ## 0. Corrections to the premises
@@ -42,7 +49,7 @@ Severity: **C** = invalidates a reported number, **M** = biases it, **m** = mino
 | Sev | Where | Issue | Fix |
 |---|---|---|---|
 | **C** | `:1585` | The game context is built with `exclude_video=None`, from frames of *every* video of the game, including test videos and their glitch segments. The note's `valid_oddities` field can describe the very glitch under evaluation as normal. The notes are not split-aware, and Stage 3 reuses them. | Build notes from training-split videos only. NORMA replaces text notes with a statistical normality reference (§2). |
-| **M** | `:728` | Timestamps are `pts * time_base` with no `stream.start_time` subtracted. Containers with a non-zero start shift every window against the annotation clock, which biases tIoU. | NORMA re-bases to the first frame (`norma/data.py`). |
+| **M** | `:728` | Timestamps are `pts * time_base` with no `stream.start_time` subtracted. Containers with a non-zero start shift every window against the annotation clock, which biases tIoU. | NORMA re-bases to the first frame (`norma_vgb.py`, `_timed_frames`). |
 | **M** | `:1769-1770` | The unattributed fallback is labelled `state_logic` with coarse label `Other`, which contradicts `FINE_TO_COARSE` (`state_logic → Game Logic`). | — |
 | **M** | `:127-136` vs Stage 3 `:40-49` | The two files disagree on `FINE_TO_COARSE` (clipping: Visual vs Physics; animation: Animation vs Visual; ui_hud: Game Logic vs Visual). The coarse sets differ too, and Stage 12 has an "Animation" class the paper lacks. | One mapping. Moot on VGB, which has no GT categories. |
 | m | `:434` | `load_records` silently falls back to another split if the requested one fails. | Fail instead. |
@@ -58,10 +65,10 @@ The Stage 1/2 file also does several things well, and NORMA reuses them:
 
 | Sev | Where | Issue | Fix |
 |---|---|---|---|
-| **C** | `:1361`, `:1997` | `log_odds = z + logit(prior)` treats a z-score of the logit under negatives as a log-likelihood ratio. Under an equal-variance Gaussian model the LLR is `d·z − d²/2` with `d = (μ₁−μ₀)/σ₀`, so the formula is wrong unless d = 1 and the offset is ignored. Downstream, the "posterior" drives the cost-based gate and the 0.98 bypass, and the same quantity *plus the prior* is used as an HMM emission. The prior is then **counted twice**: once in the emission and once in the transitions. | Hybrid HMM: emission `logit p(s|x) − logit π` (Bourlard & Morgan 1994), with p from a calibrated discriminative model (`norma/head.py`). |
+| **C** | `:1361`, `:1997` | `log_odds = z + logit(prior)` treats a z-score of the logit under negatives as a log-likelihood ratio. Under an equal-variance Gaussian model the LLR is `d·z − d²/2` with `d = (μ₁−μ₀)/σ₀`, so the formula is wrong unless d = 1 and the offset is ignored. Downstream, the "posterior" drives the cost-based gate and the 0.98 bypass, and the same quantity *plus the prior* is used as an HMM emission. The prior is then **counted twice**: once in the emission and once in the transitions. | Hybrid HMM: emission `logit p(s|x) − logit π` (Bourlard & Morgan 1994), with p from a calibrated discriminative model (`norma_vgb.py`, `decode_video`). |
 | **C** | `:2250` vs `:2253` | The `kairos_no_xnm` ablation still applies XNM (z, posterior, conformal p) because `calibrate_windows` runs **before** `use_memory` is checked. Only notes and traps are removed, so the ablation table misattributes gains. | — |
 | **C** | `:1819`, `:1523` | The in-house "glide" baseline repeats `refiner.verify` up to 5× with an *identical* prompt. Calls after the first are cache hits returning the same verdict, but each is still counted in `calls`. GliDe's iterations do nothing, and GliDe is charged for them. There is also no tool use, no SAM3 and no 3-role debate. **It is not GliDe.** | Compare against published GliDe numbers re-anchored by your own vanilla row, plus a direct-SFT control. |
-| **C** | `:553` | The paired bootstrap p-value ORs two different rejection events (the shifted test *and* sign-crossing). That is not a valid test of any stated null. | Null-centred bootstrap (Hall & Wilson 1991), clustered by game (`norma/metrics.py`). |
+| **C** | `:553` | The paired bootstrap p-value ORs two different rejection events (the shifted test *and* sign-crossing). That is not a valid test of any stated null. | Null-centred bootstrap (Hall & Wilson 1991), clustered by game (`norma_vgb.py`, `paired_test`). |
 | **M** | `:1075`, `:1919` | The conformal calibration set is made of *overlapping* windows (stride = window/2) from the same videos, so exchangeability does not hold. BH runs per video at q = 0.25, and the fallback forces at least one candidate in **every** video, including clean ones. | — |
 | **M** | `:1404` | "Traps": scanner evidence from train windows labelled negative under a 25%-coverage rule is injected as *"legitimate gameplay, do not re-flag"*. A window next to a real glitch, with coverage under 0.25, can describe that glitch. This teaches the refiner to suppress recurring real bugs of that game. | — |
 | **M** | `:1458` | The calibrated posterior and p-value are shown to the LLM refiner, which anchors on the number (anchoring bias). | — |
@@ -143,75 +150,114 @@ Contributions 2 to 4 are claims only if their ablations hold up under the paired
 
 ---
 
-## 3. Protocol
+## 3. Fair comparison with GliDe: every aspect, enforced in code
 
-1. **Splits.** `split --k 5`: game-disjoint, genre-stratified folds, with about 12% of the training games held out per fold as dev. Every fit (bank, head, describer, calibration, thresholds) uses train or dev only.
-2. **Systems, all on the same out-of-fold videos and the same judge:**
-   - `vanilla`: the off-the-shelf backbone, whole video, JSON report.
-   - `direct`: the same, after LoRA-SFT on train.
-   - `norma`.
-3. **Judge.** Use a fixed, named judge, e.g. a local Qwen2.5-72B-Instruct served via vLLM, or gpt-4o-mini, and report it. Cross-judge sanity check: Spearman correlation of per-video S across two judges.
-4. **Statistics.**
-   - 95% game-cluster bootstrap CIs.
-   - Paired null-centred cluster bootstrap for NORMA vs each baseline on F1, mIoU and F1×IoU, with Holm correction.
-   - Per-genre breakdown, and R@tIoU at 0.3, 0.5 and 0.7.
-5. **"Beats GliDe" is claimable for a backbone only if both hold:**
-   - (a) NORMA beats `direct` significantly.
-   - (b) NORMA − vanilla(your judge) > GliDe − vanilla(paper), i.e. a larger gain over the same anchor, ideally with NORMA's absolute numbers above GliDe's too.
-6. **Cost.** Report prefills, generations and wall-clock per video (written by `extract` and `predict`). Analytically, NORMA costs:
-   - about ⌈duration / 8 s⌉ prefills, roughly 3 for an average VGB clip;
-   - plus, per event (about 1 per video), 1 prefill, 1 greedy generation and N MBR samples.
+| Aspect | What is held identical | Where it is enforced |
+|---|---|---|
+| Videos | All 5,238. Trained systems use out-of-fold predictions from 5 game-disjoint folds, so the union of test folds is GliDe's evaluation set. Training-free systems (vanilla, glide) are run fold by fold on the same test lists. | `make_folds`, `assert_disjoint`; `compare` checks a hash of the evaluated video list |
+| Frames | One PyAV decoder and one 4 fps grid (GliDe's rate), with t = 0 at the first displayed frame, shared by every system | `decode_uniform_frames`, `subsample` |
+| Pixels | One per-frame budget (`--max-pixels`). GliDe's 2×4 grid image gets 8× that budget, so each of its frames is seen at the same resolution. | `QwenFamily.generate_image`; budget recorded in the fairness fingerprint |
+| Backbone | Same checkpoint, `--revision` and dtype for every system | `fairness_fingerprint`; `compare` refuses mismatches |
+| Input format | GliDe: non-overlapping 8-frame 2×4 grids with frame indices. vanilla/direct: the whole video with the same frame cap. NORMA: 8 s chunks. | `GlideRunner.windows`, `make_grid`, `sample_io` |
+| GliDe algorithm | Scanner fields and recall bias, game memory, Planner/Executor/Reflector with vqa / zoom_in / object_tracking, Advocate/Skeptic/Judge, ≤ 5 rounds, stop at confidence ≥ 0.80, first-match grounding with extension, summariser, T = 0.5, 512/1024 tokens | `GlideRunner` (see the deviations below) |
+| Output | One report schema for all systems, with the same clipping and merging | `REPORT_SCHEMA`, `parse_report`, `report_row` |
+| Judge | One named judge, prompt, normalisation (S/5) and cache | `Judge`; `compare` refuses different judges |
+| Randomness | Stochastic systems (glide at T = 0.5, NORMA's MBR sampling) are run with several seeds. Per-video scores are averaged over runs before testing. | `cmd_compare` (`name=tag1,tag2,…`), `_mean_scores` |
+| Training data | GliDe trains on nothing. `direct` gets exactly NORMA's training videos and LoRA recipe, which isolates the architecture from the act of fine-tuning. | `train_lm` (shared by describer and direct) |
+| Cost | Every model call goes through one `CostMeter`: calls, input/output tokens, seconds and peak GPU memory per video for every system. NORMA's feature extraction is amortised into its per-video cost, and training GPU-hours are reported. | `Backbone.meter`, `cmd_cost` |
+| Statistics | 95% CIs from a game-clustered bootstrap. Paired, null-centred cluster-bootstrap tests, Holm-corrected. | `bootstrap_ci`, `paired_test`, `holm` |
 
-   GliDe costs one 512-token scanner generation per 2 s window (about 10 per clip). It adds up to 5 debate rounds of several agents per flagged window, plus linking and summarising calls.
-7. **Cross-domain generalisation.** `prepare-generic` maps any temporally annotated anomaly dataset (UCF-Crime, XD-Violence, MSAD) into the same layout. Train on VGB and transfer, or train in-domain. The evaluation reports unit-level AUROC/AP, the VAD convention, alongside the GliDe protocol.
+**GliDe reproduction: the honest limits.**
+- **Prompts.** The paper's verbatim prompts are not available, so the wording is reconstructed from its description.
+- **Tracking.** SAM3 is replaced by global normalised-cross-correlation template tracking, which feeds the paper's four physics rules. The velocity threshold is rescaled from 500 px/s to 0.34 frame-diagonals/s.
+- **Choices in GliDe's favour,** where the paper is silent: the Judge sees the window image, and boundaries use the Scanner's `frame_range`.
+- **Reporting.** Report your reproduction's numbers next to the paper's Table 3. If they fall far below the paper's, say so rather than claiming a win.
 
----
+## 4. SonarCloud findings on PR #1 (39) and their resolution in `norma_vgb.py`
 
-## 4. Running
+| # | Rule (file:line in PR #1) | Resolution |
+|---|---|---|
+| 1 | Weak hashing, SHA-1 (`common.py:62`) | `stable_hash` uses SHA-256, for cache keys only |
+| 2–4 | Path traversal from CLI arguments in `read_jsonl`/`write_jsonl` (`common.py:72,86,88`) | Every file access goes through `safe_path`: `realpath` plus `commonpath` containment in the working dir or `NORMA_DATA_ROOTS`. A path outside these roots raises `PermissionError` (self-tested). |
+| 5 | Unsafe call: pickle `torch.load(weights_only=False)` (`pipeline.py:194`) | The checkpoint is a tensor-only `state_dict` loaded with `weights_only=True`, plus JSON and a pickle-free `.npz` (`allow_pickle=False`). Adapters are PEFT safetensors. |
+| 6–11 | PRNG hotspots, `random` (`describer.py`, `splits.py`) | The `random` module is gone. All randomness uses a seeded `np.random.Generator(PCG64)` via `make_rng`. **This is a cryptography rule.** Seeded generators are *required* here for reproducible folds, crops and bootstrap draws. If Sonar still lists them as hotspots, mark them *Safe* with that justification. |
+| 12 | `torch.unique` without `dim` (`head.py:375`) | Removed; ids come from a Python set |
+| 13–14 | `x != x` NaN check, identical operands and an always-false condition (`pipeline.py:154`) | `math.isnan` |
+| 15–16 | Float equality (`selftest.py:52,66`) | `math.isclose`; AUROC tie handling now uses `scipy.stats.rankdata` |
+| 17 | Duplicated `"<|im_end|>"` literal | `QWEN_END`; also `UTF8`, `VIDEOS_FILE`, `TRAIN_SUMMARY`, `MOCK_TELEPORT` |
+| 18 | Empty method (`backbones.py:644`) | Documented no-op plus a log line; base-class methods raise `NotImplementedError` |
+| 19–26 | Cognitive complexity > 15 in 9 functions | Every function is now ≤ 15 (checked with `complexipy`, which implements Sonar's definition) |
+| 27 | `decode_video` argument type mismatch | Typed `Transitions` and `DecodeParams` dataclasses; `mypy --check-untyped-defs` passes with no issues |
+| 28 | `train_lm` has 14 parameters | Takes an `LMSpec` dataclass; no function has more than 13 parameters |
+| 29 | Unused parameter `trans` (`head.py:600`) | Removed |
+| 30–39 | `set()`/`dict()` constructors, nested `with`, unused `step` | Literals and comprehensions, a combined `with`, the unused variable removed (ruff C4/SIM/F are clean) |
+
+Also fixed while consolidating, beyond Sonar's list:
+- **Decoder timestamps:** frames are re-based to t = 0 at the first displayed frame.
+- **No silent split fallback:** the requested dataset split is used verbatim.
+- **No test-pixel leakage:** NORMA's normality reference is statistical (the video's own median plus a bank built from training games only); there are no per-game text notes built from test videos.
+- **Name collision:** a CLI helper had shadowed a command helper; the CLI builders are now `_add_*`.
+- **NCC tracker:** the search is global, and the template is padded with context.
+
+## 5. Running
 
 ```bash
 pip install -r requirements-norma.txt
-python vgb_stage12.py preprocess --video-root /path/VideoGlitchBench/raw --out-dir vgb_work --fps 4
-python run_norma.py selftest                                   # CPU, ~1 min
+export NORMA_DATA_ROOTS=/path/to/VideoGlitchBench          # videos may live outside the working dir
+python norma_vgb.py selftest                                 # CPU, about a minute
 
-M=Qwen/Qwen2.5-VL-7B-Instruct; F=norma_feats/qwen7b; R=norma_run/qwen7b
-python run_norma.py split   --work-dir vgb_work --run-dir $R --k 5
-python run_norma.py extract --work-dir vgb_work --feat-dir $F --model $M        # 1 GPU pass
+M=Qwen/Qwen2.5-VL-7B-Instruct; REV=<commit>; W=vgb_work; R=runs/qwen7b; F=feats/qwen7b
+COMMON="--work-dir $W --run-dir $R --feat-dir $F --model $M --revision $REV"
+python norma_vgb.py preprocess --work-dir $W --video-root /path/to/VideoGlitchBench/raw
+python norma_vgb.py split   --work-dir $W --run-dir $R --k 5
+python norma_vgb.py extract $COMMON
 for f in 0 1 2 3 4; do
-  python run_norma.py train-head --work-dir vgb_work --run-dir $R --feat-dir $F --fold $f
-  python run_norma.py train-desc --work-dir vgb_work --run-dir $R --model $M --fold $f
-  python run_norma.py train-desc --work-dir vgb_work --run-dir $R --model $M --fold $f --direct
-  python run_norma.py predict    --work-dir vgb_work --run-dir $R --feat-dir $F --model $M --fold $f
-  python run_norma.py baseline   --work-dir vgb_work --run-dir $R --model $M --fold $f --mode direct
-  python run_norma.py baseline   --work-dir vgb_work --run-dir $R --model $M --fold $f --mode vanilla
+  python norma_vgb.py train-head --work-dir $W --run-dir $R --feat-dir $F --fold $f
+  python norma_vgb.py train-desc $COMMON --fold $f
+  python norma_vgb.py train-desc $COMMON --fold $f --direct
+  for s in 0 1 2; do python norma_vgb.py predict  $COMMON --fold $f --tag norma_s$s --seed $s; done
+  for s in 0 1 2; do python norma_vgb.py baseline $COMMON --fold $f --mode glide --tag glide_s$s --seed $s; done
+  python norma_vgb.py baseline $COMMON --fold $f --mode direct
+  python norma_vgb.py baseline $COMMON --fold $f --mode vanilla
 done
-for t in norma direct vanilla; do
-  python run_norma.py evaluate --work-dir vgb_work --run-dir $R --tag $t \
-      --judge-backend openai --judge-model Qwen/Qwen2.5-72B-Instruct --judge-base-url http://localhost:8000/v1
-done
-python run_norma.py compare --run-dir $R --system norma --baselines direct vanilla
+python norma_vgb.py evaluate --work-dir $W --run-dir $R \
+    --tags norma_s0 norma_s1 norma_s2 glide_s0 glide_s1 glide_s2 direct vanilla \
+    --judge-backend openai --judge-model Qwen/Qwen2.5-72B-Instruct --judge-base-url http://localhost:8000/v1
+SYS="norma=norma_s0,norma_s1,norma_s2 glide=glide_s0,glide_s1,glide_s2 direct=direct vanilla=vanilla"
+python norma_vgb.py compare --run-dir $R --systems $SYS
+python norma_vgb.py cost    --run-dir $R --systems $SYS
 ```
 
 Other backbones:
-- `--model Qwen/Qwen2.5-VL-3B-Instruct`
-- `--model ByteDance-Seed/UI-TARS-1.5-7B` (Qwen2.5-VL architecture)
-- `--model OpenGVLab/InternVL2_5-4B` or `OpenGVLab/InternVL2_5-8B` (one 448² tile per frame, 2 fps by default)
+- `Qwen/Qwen2.5-VL-3B-Instruct` and `ByteDance-Seed/UI-TARS-1.5-7B` use the Qwen path as above.
+- `OpenGVLab/InternVL2_5-4B` and `OpenGVLab/InternVL2_5-8B` additionally need `--trust-remote-code` and a pinned `--revision`, since these checkpoints execute their own code.
 
-Use a separate `--feat-dir` and `--run-dir` per backbone.
+Ablations:
+- `train-head` flags: `--no-srn`, `--no-bank`, `--no-delta`, `--no-ctx`, `--no-group`, each with `--tag-suffix`.
+- `predict` flags: `--no-describer`, `--no-fusion`, `--mbr-samples 0`.
 
----
+## 6. Honest status
 
-## 5. Honest status
-
-**Verified in this repository** (`python run_norma.py selftest`):
+**Verified here** with `python norma_vgb.py selftest`, 24 checks:
 - **Estimators:** interval algebra, Hungarian matching, Viterbi, IRLS logistic regression, AUROC with ties, Holm correction.
-- **Paired-test size:** 2/40 false rejections at α = 0.05.
-- **Real Qwen2.5-VL modules** (tiny random config): layer-tap equality with HF `hidden_states`, early exit, unit-pooling order, LoRA placement (language model only), a finite-gradient training step, and adapter-disabled extraction.
-- **Full CPU pipeline on a synthetic corpus** through the mock backbone.
+- **Paired-test size:** at most 6/40 false rejections at α = 0.05.
+- **Path guard:** a path outside the allowed roots is rejected.
+- **Decoder:** a real MP4 decodes to a 4 fps grid starting at t = 0.
+- **NCC tracker and physics rules:** a teleport is detected, and smooth motion stays quiet.
+- **Real Qwen2.5-VL modules** (tiny random config): layer taps, early exit, unit pooling, LoRA placed on the language model only.
+- **Fairness gate:** a mismatched comparison is refused.
+- **CPU end-to-end run** of all four systems through the mock backbone.
 
-**Not verified here** (no GPU and no Hugging Face access in this environment):
-- Loading the real 3B–8B checkpoints.
-- The InternVL2.5 path, which uses `trust_remote_code` internals.
-- Throughput, and any VGB number.
+Static checks: `mypy --check-untyped-defs` passes, ruff (including the bandit rule set) is clean, and no function exceeds cognitive complexity 15.
 
-**Whether NORMA beats GliDe is an empirical question that only the protocol above can answer.**
+**Not verified here** (no GPU and no Hugging Face access):
+- Loading the real checkpoints; InternVL's remote-code path.
+- Wall-clock cost.
+- Any VGB number.
+
+The metric values printed by the self-test come from a rule-based mock, and they say nothing about any system. **Whether NORMA beats GliDe is decided only by running §5 and applying the claim criteria below.**
+
+To claim "NORMA beats GliDe" for a backbone, all of the following must hold:
+- (a) NORMA beats `direct`, significantly after Holm correction.
+- (b) NORMA beats the in-harness `glide`, significantly.
+- (c) NORMA's gain over `vanilla` exceeds GliDe's gain over vanilla as reported in the paper.
